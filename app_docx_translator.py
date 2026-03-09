@@ -8,6 +8,7 @@ import streamlit as st
 import boto3
 from botocore.config import Config
 import json
+import hashlib
 import io
 import os
 import re
@@ -19,6 +20,95 @@ from docx import Document
 # Configure logger for QA validation
 logger = logging.getLogger("translation_qa")
 logging.basicConfig(level=logging.INFO)
+
+
+# =============================================================================
+# Translation Cache (Valkey / Redis / In-Memory fallback)
+# =============================================================================
+
+class TranslationCache:
+    """Cache translated text to skip redundant API calls.
+
+    Priority: Valkey/Redis → In-memory dict fallback.
+    Cache key = hash(model + system_prompt + source_text).
+    """
+
+    def __init__(self):
+        self._redis = None
+        self._memory: dict[str, str] = {}
+        self._hits = 0
+        self._misses = 0
+        self._connect_valkey()
+
+    def _connect_valkey(self):
+        """Try connecting to Valkey/Redis. Fail silently to in-memory."""
+        valkey_url = os.getenv("VALKEY_URL", "redis://localhost:6379/0")
+        try:
+            import valkey as redis_lib
+            self._redis = redis_lib.from_url(valkey_url, decode_responses=True,
+                                              socket_connect_timeout=2)
+            self._redis.ping()
+            logger.info("Translation cache: connected to Valkey at %s", valkey_url)
+        except Exception:
+            try:
+                import redis as redis_lib
+                self._redis = redis_lib.from_url(valkey_url, decode_responses=True,
+                                                  socket_connect_timeout=2)
+                self._redis.ping()
+                logger.info("Translation cache: connected to Redis at %s", valkey_url)
+            except Exception:
+                self._redis = None
+                logger.info("Translation cache: using in-memory fallback")
+
+    @staticmethod
+    def _make_key(model_id: str, system_prompt: str, source: str) -> str:
+        raw = f"{model_id}|{system_prompt}|{source}"
+        return "txcache:" + hashlib.sha256(raw.encode()).hexdigest()
+
+    def get(self, model_id: str, system_prompt: str, source: str) -> str | None:
+        key = self._make_key(model_id, system_prompt, source)
+        result = None
+        if self._redis:
+            try:
+                result = self._redis.get(key)
+            except Exception:
+                pass
+        if result is None:
+            result = self._memory.get(key)
+        if result is not None:
+            self._hits += 1
+        else:
+            self._misses += 1
+        return result
+
+    def set(self, model_id: str, system_prompt: str, source: str,
+            translated: str, ttl: int = 86400):
+        key = self._make_key(model_id, system_prompt, source)
+        self._memory[key] = translated
+        if self._redis:
+            try:
+                self._redis.setex(key, ttl, translated)
+            except Exception:
+                pass
+
+    @property
+    def stats(self) -> dict:
+        total = self._hits + self._misses
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": f"{self._hits / total * 100:.1f}%" if total > 0 else "N/A",
+            "backend": "Valkey/Redis" if self._redis else "In-Memory",
+            "cached_items": len(self._memory) + (
+                0 if not self._redis else 0  # Redis count is expensive, skip
+            ),
+        }
+
+
+# Global cache instance (persists across Streamlit reruns)
+@st.cache_resource
+def get_translation_cache() -> TranslationCache:
+    return TranslationCache()
 
 from glossary_manager import (
     load_projects, save_projects, load_merged_glossary,
@@ -435,13 +525,20 @@ def build_chunks(paragraphs: list[dict], max_chars: int) -> list[dict]:
 
 def translate_document(paragraphs, model_name, region, ollama_url, chunk_size,
                        system_prompt="", progress_callback=None,
-                       max_retries: int = 2, qa_line_ratio: float = 0.8):
+                       max_retries: int = 2, qa_line_ratio: float = 0.8,
+                       glossary: dict | None = None,
+                       style_rules: str = ""):
     """Translate all paragraphs in chunks with QA validation and auto-retry.
 
     Args:
         max_retries: Max re-translation attempts per chunk on QA failure.
         qa_line_ratio: Minimum output/input line ratio before flagging summarization.
+        glossary: Full merged glossary dict for per-chunk matching.
+        style_rules: Style rules string from glossary.
     """
+    cache = get_translation_cache()
+    model_id = ALL_MODELS[model_name]["model_id"]
+
     translated = [""] * len(paragraphs)
     chunks = build_chunks(paragraphs, chunk_size)
     total = len(chunks)
@@ -454,11 +551,29 @@ def translate_document(paragraphs, model_name, region, ollama_url, chunk_size,
 
         source_text = chunk["text"]
 
-        if progress_callback:
-            progress_callback(ci + 1, total, f"Translating chunk {ci + 1}/{total}...")
+        # --- Per-chunk glossary matching (token optimization) ---
+        if glossary and (glossary.get("characters") or glossary.get("places") or glossary.get("terms")):
+            chunk_matched = scan_text_for_glossary(source_text, glossary)
+            has_match = any(chunk_matched.get(k) for k in ("characters", "places", "terms"))
+            if has_match:
+                chunk_glossary_json = build_glossary_json(chunk_matched)
+                chunk_system_prompt = build_system_prompt(chunk_glossary_json, style_rules)
+            else:
+                chunk_system_prompt = build_system_prompt("", style_rules)
+        else:
+            chunk_system_prompt = system_prompt
 
-        # --- Translate with QA validation loop ---
-        result = translate_text(source_text, model_name, region, ollama_url, system_prompt)
+        # --- Cache lookup ---
+        cached = cache.get(model_id, chunk_system_prompt, source_text)
+        if cached is not None:
+            result = cached
+            if progress_callback:
+                progress_callback(ci + 1, total, f"Chunk {ci + 1}/{total} — cache hit!")
+        else:
+            if progress_callback:
+                progress_callback(ci + 1, total, f"Translating chunk {ci + 1}/{total}...")
+
+            result = translate_text(source_text, model_name, region, ollama_url, chunk_system_prompt)
 
         qa = validate_translation(source_text, result, line_ratio_threshold=qa_line_ratio)
 
@@ -477,14 +592,24 @@ def translate_document(paragraphs, model_name, region, ollama_url, chunk_size,
 
             # Build enhanced retry prompt
             retry_user_msg = build_retry_prompt(source_text, qa)
-            result = translate_text(retry_user_msg, model_name, region, ollama_url, system_prompt)
+            result = translate_text(retry_user_msg, model_name, region, ollama_url, chunk_system_prompt)
             qa = validate_translation(source_text, result, line_ratio_threshold=qa_line_ratio)
+
+        # Cache the result if QA passed (don't cache bad translations)
+        if qa.passed and cached is None:
+            cache.set(model_id, chunk_system_prompt, source_text, result)
 
         # Collect report for every chunk
         src_special = _extract_special_lines(source_text)
+        chunk_matched_count = 0
+        if glossary and (glossary.get("characters") or glossary.get("places") or glossary.get("terms")):
+            cm = scan_text_for_glossary(source_text, glossary)
+            chunk_matched_count = len(cm.get("characters", [])) + len(cm.get("places", [])) + len(cm.get("terms", []))
         qa_reports.append({
             "chunk": ci + 1,
             "passed": qa.passed,
+            "cache_hit": cached is not None,
+            "glossary_terms": chunk_matched_count,
             "src_lines": _count_nonempty_lines(source_text),
             "tgt_lines": _count_nonempty_lines(result),
             "line_ratio": qa.line_ratio,
@@ -944,13 +1069,13 @@ def main():
         trans_placeholder.text_area("trans", value="", height=400, disabled=True,
                                     label_visibility="collapsed", key="t_init")
 
-    # System prompt preview
+    # System prompt preview (shows example for full-text match; actual per-chunk prompts may differ)
+    style_rules = glossary.get("style_rules", "") if has_glossary else ""
     if has_glossary and matched:
         glossary_json_str = build_glossary_json(matched)
-        style_rules = glossary.get("style_rules", "")
         system_prompt = build_system_prompt(glossary_json_str, style_rules)
 
-        with st.expander("System Prompt Preview", expanded=False):
+        with st.expander("System Prompt Preview (full-text match — per-chunk matching is smaller)", expanded=False):
             st.text_area(
                 "prompt_preview",
                 value=system_prompt,
@@ -979,6 +1104,8 @@ def main():
             translated_texts, qa_warnings, qa_reports = translate_document(
                 paragraphs, model_name, region, ollama_url, chunk_size,
                 system_prompt=system_prompt, progress_callback=on_progress,
+                glossary=glossary if has_glossary else None,
+                style_rules=style_rules,
             )
 
             progress_bar.progress(1.0)
@@ -996,6 +1123,8 @@ def main():
             passed_chunks = sum(1 for r in qa_reports if r["passed"])
             failed_chunks = total_chunks - passed_chunks
             total_retries = sum(r["retries"] for r in qa_reports)
+            cache_hits = sum(1 for r in qa_reports if r.get("cache_hit"))
+            cache = get_translation_cache()
 
             if failed_chunks == 0:
                 st.success(f"QA Validation: ALL {total_chunks} chunk(s) PASSED")
@@ -1004,23 +1133,29 @@ def main():
 
             with st.expander("QA Validation Details", expanded=(failed_chunks > 0)):
                 # Summary metrics
-                qc1, qc2, qc3, qc4 = st.columns(4)
+                qc1, qc2, qc3, qc4, qc5 = st.columns(5)
                 qc1.metric("Total Chunks", total_chunks)
                 qc2.metric("Passed", passed_chunks)
                 qc3.metric("Failed", failed_chunks)
                 qc4.metric("Retries", total_retries)
+                qc5.metric("Cache Hits", cache_hits,
+                           help=f"Backend: {cache.stats['backend']} | "
+                                f"Session hit rate: {cache.stats['hit_rate']}")
 
                 st.markdown("---")
 
                 # Per-chunk detail
                 for r in qa_reports:
                     status_icon = "PASS" if r["passed"] else "FAIL"
+                    cache_icon = "CACHED" if r.get("cache_hit") else "API"
+                    glossary_info = f"Glossary: {r.get('glossary_terms', 0)} terms"
                     st.markdown(
-                        f"**Chunk {r['chunk']}** — `{status_icon}` | "
+                        f"**Chunk {r['chunk']}** — `{status_icon}` `{cache_icon}` | "
                         f"Lines: {r['src_lines']} → {r['tgt_lines']} "
                         f"(ratio: {r['line_ratio']:.2f}) | "
                         f"Special chars: {r['src_special_count']} found, "
                         f"{r['missing_special_count']} missing | "
+                        f"{glossary_info} | "
                         f"Retries: {r['retries']}"
                     )
                     if r["issues"]:

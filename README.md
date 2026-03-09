@@ -5,44 +5,55 @@
 ## 개요
 
 AWS Bedrock 기반 번역 시스템으로, 다중 모델(Claude, Cohere, Ollama)을 지원하며
-프로젝트별 용어집(Glossary) 관리와 **번역 품질 자동 검증(QA Validation)** 기능을 포함합니다.
+프로젝트별 용어집(Glossary) 관리, **번역 품질 자동 검증(QA Validation)**,
+**Valkey/Redis 번역 캐시**, **청크별 용어집 최적화** 기능을 포함합니다.
 
 ## 아키텍처
 
 ```mermaid
 flowchart TD
     A[한글 원문 입력] --> B[청킹 Chunking]
-    B --> C[번역 엔진 호출]
+    B --> C{캐시 확인}
+
+    subgraph Cache["Valkey / Redis Cache"]
+        C -->|HIT| D[캐시된 번역 반환]
+        C -->|MISS| E[청크별 용어집 매칭]
+    end
+
+    E --> F[번역 엔진 호출]
 
     subgraph Engine["번역 엔진"]
-        C --> D{모델 선택}
-        D -->|Claude| E[Bedrock Claude]
-        D -->|Cohere| F[Bedrock Cohere]
-        D -->|Ollama| G[로컬 Ollama]
+        F --> G{모델 선택}
+        G -->|Claude| H[Bedrock Claude]
+        G -->|Cohere| I[Bedrock Cohere]
+        G -->|Ollama| J[로컬 Ollama]
     end
 
-    E --> H[QA Validation]
-    F --> H
-    G --> H
+    H --> K[QA Validation]
+    I --> K
+    J --> K
 
     subgraph QA["품질 검증 QA"]
-        H --> I{축약 감지}
-        H --> J{특수문자 라인 보존}
-        I -->|FAIL| K[자동 재번역 최대 2회]
-        J -->|FAIL| K
-        K --> H
-        I -->|PASS| L[통과]
-        J -->|PASS| L
+        K --> L{축약 감지}
+        K --> M{특수문자 라인 보존}
+        L -->|FAIL| N[자동 재번역 최대 2회]
+        M -->|FAIL| N
+        N --> K
+        L -->|PASS| O[통과]
+        M -->|PASS| O
     end
 
-    L --> M[최종 번역 결과]
-    M --> N[QA 리포트 표시]
-    M --> O[DOCX / TXT 다운로드]
+    O --> P[캐시 저장]
+    D --> Q[최종 번역 결과]
+    P --> Q
+    Q --> R[QA 리포트 표시]
+    Q --> S[DOCX / TXT 다운로드]
 
+    style Cache fill:#f3e5f5,stroke:#7b1fa2
     style Engine fill:#e3f2fd,stroke:#1976d2
     style QA fill:#fff3e0,stroke:#f57c00
     style A fill:#c8e6c9,stroke:#388e3c
-    style M fill:#c8e6c9,stroke:#388e3c
+    style Q fill:#c8e6c9,stroke:#388e3c
 ```
 
 ## 주요 기능
@@ -50,8 +61,63 @@ flowchart TD
 - **다중 모델 지원**: Claude 4.5 Sonnet, Claude 3.5 Sonnet/Haiku, Cohere Command R/R+, Ollama
 - **DOCX 번역**: 문서 업로드 → 번역 → 서식 유지된 DOCX 다운로드
 - **프로젝트별 용어집**: Common / Genre / Work 3계층 글로서리 관리
-- **프롬프트 버전 관리**: DynamoDB + S3 기반 버전 저장/복원
+- **프롬프트 버전 관리**: DynamoDB + S3 기반 버전 저장/복원 (자동 프로비저닝)
 - **QA Validation**: 번역 품질 자동 검증 + 자동 재번역
+- **Valkey/Redis 캐시**: 동일 텍스트 재번역 시 API 호출 스킵
+- **청크별 용어집 최적화**: 청크에 등장하는 용어만 전송하여 토큰 절감
+
+## 토큰 비용 최적화
+
+### 1. 청크별 용어집 매칭
+
+기존에는 전체 텍스트에서 매칭된 용어를 모든 청크에 동일하게 전송했습니다.
+이제는 각 청크에 실제로 등장하는 용어만 골라서 시스템 프롬프트에 포함합니다.
+
+```
+기존: 전체 텍스트에서 15개 매칭 → 모든 청크에 15개 전송
+변경: 청크 1에는 5개, 청크 2에는 3개, 청크 3에는 7개만 전송
+```
+
+QA 리포트에서 청크별 `Glossary: N terms`로 확인 가능합니다.
+
+### 2. Valkey/Redis 번역 캐시
+
+동일한 텍스트 + 동일한 시스템 프롬프트 + 동일한 모델 조합이면
+캐시에서 바로 반환하여 **API 호출 자체를 스킵**합니다.
+
+```
+Cache Key = SHA256(model_id + system_prompt + source_text)
+```
+
+- **Valkey/Redis 연결 시**: 서버 캐시 (TTL 24시간, 재시작 후에도 유지)
+- **연결 실패 시**: 인메모리 캐시로 자동 폴백 (Streamlit 세션 유지)
+- **QA 통과한 번역만 캐시**: 불량 번역이 캐시되지 않음
+- QA 리포트에서 청크별 `CACHED` / `API` 표시로 확인 가능
+
+**비용 절감 시나리오:**
+| 시나리오 | 절감 효과 |
+|---------|----------|
+| 동일 문서 재번역 (모델/프롬프트 동일) | API 호출 100% 스킵 |
+| 반복 등장하는 정형 문구 (캐릭터 소개 등) | 해당 청크 API 호출 스킵 |
+| 용어집 수정 후 재번역 | 시스템 프롬프트 변경으로 캐시 미스 → 정상 재번역 |
+| 번역 실패 후 재시도 | QA 실패 결과는 캐시 안 됨 → 정상 재번역 |
+
+### 3. 프롬프트 캐싱 호환
+
+시스템 프롬프트 구조가 Bedrock 프롬프트 캐싱과 호환됩니다:
+
+```
+┌─────────────────────────────────────────┐
+│ BASE_CONTEXT (고정 - 항상 동일)           │  ← Bedrock 캐시 대상
+├─────────────────────────────────────────┤
+│ GLOSSARY JSON (청크별로 다름)              │  ← 변동 부분 (하단 배치)
+├─────────────────────────────────────────┤
+│ Style Rules (프로젝트별 고정)              │
+└─────────────────────────────────────────┘
+```
+
+고정 부분(BASE_CONTEXT)이 앞에 오고, 변동 부분(용어집)이 뒤에 위치하여
+Bedrock 프롬프트 캐싱이 활성화되면 고정 부분의 토큰 비용이 자동으로 절감됩니다.
 
 ## QA Validation (번역 품질 자동 검증)
 
@@ -165,10 +231,12 @@ ISSUE: 특수문자가 포함된 라인을 삭제했습니다.
 번역 완료 후 항상 QA Validation 리포트가 표시됩니다:
 
 - **요약 배너**: 전체 PASS/FAIL 상태
-- **상세 메트릭**: 총 청크 수 / 통과 / 실패 / 재시도 횟수
+- **상세 메트릭**: 총 청크 수 / 통과 / 실패 / 재시도 횟수 / 캐시 히트
 - **청크별 상세**:
+  - `PASS`/`FAIL` + `CACHED`/`API` 상태
   - 원문 라인 수 → 번역 라인 수 (비율)
   - 특수문자 라인 수 / 누락 수
+  - 용어집 매칭 수 (Glossary: N terms)
   - 재시도 횟수, 구체적 이슈 내용
 
 ### 테스트 샘플
@@ -205,14 +273,47 @@ pip install -r requirements.txt
 aws configure
 ```
 
-### 3. 환경변수 설정 (선택)
+### 3. 환경변수 설정
 
 ```bash
 cp .env.sample .env
-# .env 파일에서 S3 버킷, DynamoDB 테이블 등 설정
 ```
 
-### 4. 앱 실행
+`.env` 파일 설정 항목:
+
+```bash
+# S3 (용어집 버전 저장) — 미설정 시 'my-translation-prompts' 자동 생성
+PROMPT_S3_BUCKET=
+
+# DynamoDB (버전 메타데이터) — 미설정 시 'translator' 자동 생성
+PROMPT_DYNAMO_TABLE=
+
+# AWS Region — 기본값: ap-northeast-2
+PROMPT_AWS_REGION=
+
+# Valkey/Redis 캐시 — 미설정 시 인메모리 캐시 사용
+# 로컬: redis://localhost:6379/0
+# AWS ElastiCache: rediss://my-cluster.xxxxx.cache.amazonaws.com:6379/0
+VALKEY_URL=
+```
+
+S3 버킷과 DynamoDB 테이블은 **앱 첫 실행 시 자동 생성**됩니다.
+수동 프로비저닝이 필요한 경우 `deploy.sh`를 실행하세요.
+
+### 4. Valkey/Redis 설치 (선택)
+
+```bash
+# macOS (로컬 개발)
+brew install valkey
+brew services start valkey
+
+# 또는 Docker
+docker run -d --name valkey -p 6379:6379 valkey/valkey:latest
+```
+
+Valkey 없이도 앱은 정상 동작합니다 (인메모리 캐시 폴백).
+
+### 5. 앱 실행
 
 ```bash
 streamlit run app_docx_translator.py
@@ -223,16 +324,16 @@ streamlit run app_docx_translator.py
 ## 프로젝트 구조
 
 ```
-54.translate_content/
-├── app_docx_translator.py     # 메인 애플리케이션 (QA Validation 포함)
+translate_content/
+├── app_docx_translator.py     # 메인 애플리케이션 (QA + 캐시 + 청크별 용어집)
 ├── app_translator.py          # 텍스트 전용 번역기
 ├── app.py                     # 레거시 투트랙 번역기
 ├── glossary_manager.py        # 용어집 관리 모듈
-├── prompt_store.py            # 프롬프트 버전 관리 (DynamoDB + S3)
+├── prompt_store.py            # 프롬프트 버전 관리 (DynamoDB + S3, 자동 프로비저닝)
 ├── requirements.txt           # Python 의존성
-├── .env.sample                # 환경변수 템플릿
-├── .gitignore                 # Git 제외 설정
-├── deploy.sh                  # AWS 리소스 프로비저닝 스크립트
+├── .env.sample                # 환경변수 템플릿 (S3, DynamoDB, Valkey)
+├── .gitignore                 # Git 제외 설정 (.env 포함)
+├── deploy.sh                  # AWS 리소스 수동 프로비저닝 스크립트
 ├── glossaries/                # 프로젝트별 용어집 데이터
 ├── test_samples/              # QA 테스트용 샘플 텍스트
 │   ├── sample_summarization_test.txt
@@ -242,6 +343,13 @@ streamlit run app_docx_translator.py
 ```
 
 ## 버전 히스토리
+
+### v3.1 (2026-03-09)
+- Valkey/Redis 번역 캐시 추가 (동일 텍스트 재번역 시 API 호출 스킵)
+- 청크별 용어집 매칭 (청크에 등장하는 용어만 전송하여 토큰 절감)
+- S3 버킷 / DynamoDB 테이블 자동 프로비저닝 (첫 실행 시 자동 생성)
+- QA 리포트에 캐시 히트 통계 + 청크별 용어집 매칭 수 표시
+- .env.sample에 VALKEY_URL 설정 추가
 
 ### v3.0 (2026-03-09)
 - QA Validation 기능 추가 (축약 감지 + 특수문자 라인 보존 검증)

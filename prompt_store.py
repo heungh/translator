@@ -82,14 +82,49 @@ def _bucket() -> str:
 # Clients
 # ---------------------------------------------------------------------------
 
+_resources_checked = False
+
+
+def _ensure_resources():
+    """Auto-create S3 bucket and DynamoDB table if they don't exist. Runs once."""
+    global _resources_checked
+    if _resources_checked:
+        return
+    _resources_checked = True
+
+    region = _region()
+    bucket = _bucket()
+    table_name = _table_name()
+
+    # --- S3 bucket ---
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except s3.exceptions.ClientError:
+        try:
+            create_args = {"Bucket": bucket}
+            if region != "us-east-1":
+                create_args["CreateBucketConfiguration"] = {
+                    "LocationConstraint": region,
+                }
+            s3.create_bucket(**create_args)
+        except Exception as e:
+            print(f"[prompt_store] Could not create S3 bucket '{bucket}': {e}")
+
+    # --- DynamoDB table ---
+    ensure_table_exists()
+
+
 def get_dynamodb_table():
-    """Return a boto3 DynamoDB Table resource."""
+    """Return a boto3 DynamoDB Table resource (auto-creates if needed)."""
+    _ensure_resources()
     dynamodb = boto3.resource("dynamodb", region_name=_region())
     return dynamodb.Table(_table_name())
 
 
 def get_s3_client():
-    """Return a boto3 S3 client."""
+    """Return a boto3 S3 client (auto-creates bucket if needed)."""
+    _ensure_resources()
     return boto3.client("s3", region_name=_region())
 
 
