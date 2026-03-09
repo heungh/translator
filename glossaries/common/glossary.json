@@ -1,0 +1,59 @@
+{
+  "characters": [],
+  "places": [],
+  "terms": [
+    {
+      "korean": "누나",
+      "english": "Noona"
+    },
+    {
+      "korean": "누님",
+      "english": "Big Sis"
+    },
+    {
+      "korean": "언니",
+      "english": "Unnie"
+    },
+    {
+      "korean": "오빠",
+      "english": "Oppa"
+    },
+    {
+      "korean": "형",
+      "english": "Hyung"
+    },
+    {
+      "korean": "형님",
+      "english": "Big Bro"
+    },
+    {
+      "korean": "동생",
+      "english": "Younger sibling"
+    },
+    {
+      "korean": "아저씨",
+      "english": "Ahjussi"
+    },
+    {
+      "korean": "아줌마",
+      "english": "Ajumma"
+    },
+    {
+      "korean": "할머니",
+      "english": "Grandmother"
+    },
+    {
+      "korean": "할아버지",
+      "english": "Grandfather"
+    },
+    {
+      "korean": "선배",
+      "english": "Senior"
+    },
+    {
+      "korean": "후배",
+      "english": "Junior"
+    }
+  ],
+  "style_rules": "<style_guide>\n  <tone>natural_webnovel</tone>\n  <dialogue_format>double_quotes</dialogue_format>\n  <thoughts_format>italics</thoughts_format>\n  <example_good>\"I can't believe this happened,\" she said.</example_good>\n  <example_avoid>\"I cannot believe this has occurred,\" she stated.</example_avoid>\n</style_guide>\n\n<critical_rules>\n  1. NO Korean/Chinese characters in output (ㅋㅋㅋ→\"lol\", 一片丹心→translate)\n  2. Use EXACT glossary translations - never vary\n  3. Gender tags override name assumptions (glossary is absolute)\n  4. Technique names in quotes: \"Demon Blossom Palm\"\n  5. Same character = same name throughout entire series\n</critical_rules>\n\n<output_format>\n  Provide only the English translation without:\n  - Chapter titles or # symbols\n  - Quotation marks around entire text\n  - Commentary or explanations\n  - Any additional formatting headers\n  Include footnotes only if complex cultural concepts require explanation.\n</output_format>"
+}

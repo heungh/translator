@@ -1,0 +1,22 @@
+{
+  "projects": [
+    {
+      "id": "neo-incheon-hero",
+      "name": "Neo Incheon Hero",
+      "genre": "fantasy",
+      "work": "neo-incheon-hero"
+    },
+    {
+      "id": "test1",
+      "name": "test1",
+      "genre": "fantasy",
+      "work": "test1"
+    }
+  ],
+  "genres": [
+    "fantasy",
+    "scifi",
+    "romance"
+  ],
+  "active_project": "test1"
+}
